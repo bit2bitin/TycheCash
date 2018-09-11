@@ -1,4 +1,4 @@
-// Copyright (c) 2017-2018 The TycheCash developers  ; Originally forked from Copyright (c) 2012-2017, The CryptoNote developers, The Bytecoin developers 
+// Copyright (c) 2017-2018 The TycheCash developers  ; Originally forked from Copyright (c) 2012-2017, The CryptoNote developers, The Bytecoin developers
 // Distributed under the MIT/X11 software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -270,7 +270,7 @@ bool Currency::isAmountApplicableInFusionTransactionInput(uint64_t amount, uint6
   auto it = std::lower_bound(PRETTY_AMOUNTS.begin(), PRETTY_AMOUNTS.end(), amount);
   if (it == PRETTY_AMOUNTS.end() || amount != *it) {
     return false;
-  } 
+  }
 
   amountPowerOfTen = static_cast<uint8_t>(std::distance(PRETTY_AMOUNTS.begin(), it) / 9);
   return true;
@@ -397,6 +397,167 @@ difficulty_type Currency::nextDifficulty(std::vector<uint64_t> timestamps,
   return (low + timeSpan - 1) / timeSpan;
 }
 
+difficulty_type Currency::nextDifficultyV2(std::vector<uint64_t> timestamps, std::vector<difficulty_type> cumulativeDifficulties,
+  size_t targetSeconds /*= parameters::DIFFICULTY_TARGET*/) const {
+  assert(m_difficultyWindow >= 2);
+
+  if (timestamps.size() > m_difficultyWindow) {
+    timestamps.resize(m_difficultyWindow);
+    cumulativeDifficulties.resize(m_difficultyWindow);
+  }
+
+  size_t length = timestamps.size();
+  assert(length == cumulativeDifficulties.size());
+  if (length <= 1) {
+    return 1;
+  }
+
+  uint64_t weightedTimespans = 0;
+  for (size_t i = 1; i < length; i++) {
+    uint64_t timespan;
+    if (timestamps[i - 1] >= timestamps[i]) {
+      timespan = 1;
+    } else {
+      timespan = timestamps[i] - timestamps[i - 1];
+    }
+    if (timespan > 10 * targetSeconds) {
+      timespan = 10 * targetSeconds;
+    }
+    weightedTimespans += i * timespan;
+  }
+
+  // N = length - 1
+  uint64_t minimumTimespan = targetSeconds * (length - 1) / 2;
+  if (weightedTimespans < minimumTimespan) {
+    weightedTimespans = minimumTimespan;
+  }
+
+  difficulty_type totalWork = cumulativeDifficulties.back() - cumulativeDifficulties.front();
+  assert(totalWork > 0);
+
+  uint64_t low, high;
+  // adjust = 0.99 for N=60 ; length = N + 1
+  uint64_t target = 99 * (length / 2) * targetSeconds / 100;
+  low = mul128(totalWork, target, &high);
+  if (high != 0) {
+    return 0;
+  }
+  return low / weightedTimespans;
+}
+
+difficulty_type Currency::nextDifficultyV3(
+	std::vector<uint64_t> timestamps,
+	std::vector<difficulty_type> cumulativeDifficulties
+) const {
+
+	// LWMA difficulty algorithm
+	// Copyright (c) 2017-2018 Zawy
+	// MIT license http://www.opensource.org/licenses/mit-license.php.
+	// This is an improved version of Tom Harding's (Deger8) "WT-144"  
+	// Karbowanec, Masari, Bitcoin Gold, and Bitcoin Cash have contributed.
+	// See https://github.com/zawy12/difficulty-algorithms/issues/3 for other algos.
+	// Do not use "if solvetime < 0 then solvetime = 1" which allows a catastrophic exploit.
+	// T= target_solvetime;
+	// N=45, 60, 70, 100, 140 for T=600, 240, 120, 90, and 60 respectively.
+
+	const int64_t T = static_cast<int64_t>(m_difficultyTarget);
+	size_t N = TycheCash::parameters::DIFFICULTY_WINDOW_V2;
+
+	while (timestamps.size() > N + 1) {
+			timestamps.erase(timestamps.begin());
+			cumulativeDifficulties.erase(cumulativeDifficulties.begin());
+		}
+
+	size_t n = timestamps.size();
+	assert(n == cumulativeDifficulties.size());
+	assert(n <= N + 1);
+
+	if (n < N + 1) { N = n - 1; }
+
+	// To get an average solvetime to within +/- ~0.1%, use an adjustment factor.
+	const double_t adjust = 0.998;
+	// The divisor k normalizes LWMA.
+	const double_t k = N * (N + 1) / 2;
+
+	double_t LWMA(0), sum_inverse_D(0), harmonic_mean_D(0), nextDifficulty(0);
+	int64_t solveTime(0);
+	uint64_t difficulty(0), next_difficulty(0);
+
+	// Loop through N most recent blocks.
+	for (int64_t i = 1; i <= N; i++) {
+		solveTime = static_cast<int64_t>(timestamps[i]) - static_cast<int64_t>(timestamps[i - 1]);
+		solveTime = std::min<int64_t>((T * 7), std::max<int64_t>(solveTime, (-7 * T)));
+		difficulty = cumulativeDifficulties[i] - cumulativeDifficulties[i - 1];
+		LWMA += solveTime * i / k;
+		sum_inverse_D += 1 / static_cast<double_t>(difficulty);
+	}
+
+	// Keep LWMA sane in case something unforeseen occurs.
+	if (static_cast<int64_t>(std::round(LWMA)) < T / 20)
+		LWMA = static_cast<double_t>(T / 20);
+
+	harmonic_mean_D = N / sum_inverse_D * adjust;
+	nextDifficulty = harmonic_mean_D * T / LWMA;
+	next_difficulty = static_cast<uint64_t>(nextDifficulty);
+
+	// minimum limit
+	if (next_difficulty < 1) {
+		next_difficulty = 1;
+	}
+
+	return next_difficulty;
+}
+
+difficulty_type Currency::nextDifficultyV4(std::vector<uint64_t> timestamps,
+	std::vector<difficulty_type> cumulativeDifficulties) const {
+
+	int64_t T = parameters::DIFFICULTY_TARGET;
+	int64_t N = parameters::DIFFICULTY_WINDOW_V1 - 1; //  N=45, 60, and 90 for T=600, 120, 60.
+	int64_t FTL = parameters::TycheCash_BLOCK_FUTURE_TIME_LIMIT_V1; // < 3xT
+	int64_t L(0), ST, sum_3_ST(0), next_D, prev_D;
+
+	for (int64_t i = 1; i <= N; i++) {
+		// +/- FTL limits are bad timestamp protection.  6xT limits drop in D to reduce oscillations.
+		ST = std::max(-FTL, std::min((int64_t)(timestamps[i]) - (int64_t)(timestamps[i - 1]), 6 * T));
+		L += ST * i; // Give more weight to most recent blocks.
+		if (i > N - 3) { sum_3_ST += ST; }
+	}
+
+	// Calculate next_D = avgD * T / LWMA(STs) using integer math
+	next_D = ((cumulativeDifficulties[N] - cumulativeDifficulties[0])*T*(N + 1) * 99) / (100 * 2 * L);
+
+	// Implement LWMA-2 changes from LWMA
+	prev_D = cumulativeDifficulties[N] - cumulativeDifficulties[N - 1];
+	if (sum_3_ST < (8 * T) / 10) { next_D = (prev_D * 110) / 100; }
+
+	return static_cast<uint64_t>(next_D);
+
+	// next_Target = sumTargets*L*2/0.998/T/(N+1)/N/N; // To show the difference.
+}
+difficulty_type Currency::nextDifficultyV5(std::vector<uint64_t> timestamps, std::vector<difficulty_type> cumulativeDifficulties) const {
+
+	int64_t T = parameters::DIFFICULTY_TARGET;
+	int64_t N = parameters::DIFFICULTY_WINDOW_V5 - 1; //  N=45, 60, and 90 for T=600, 120, 60.
+	int64_t FTL = parameters::TycheCash_BLOCK_FUTURE_TIME_LIMIT_V1; // < 3xT
+	int64_t L(0), ST, sum_3_ST(0), next_D, prev_D;
+	for (int64_t i = 1; i <= N; i++) {
+		// +/- FTL limits are bad timestamp protection.  6xT limits drop in D to reduce oscillations.
+		ST = std::max(-FTL, std::min((int64_t)(timestamps[i]) - (int64_t)(timestamps[i - 1]), 6 * T));
+		L += ST * i; // Give more weight to most recent blocks.
+		if (i > N - 3) { sum_3_ST += ST; }
+	}
+
+	// Calculate next_D = avgD * T / LWMA(STs) using integer math
+	next_D = ((cumulativeDifficulties[N] - cumulativeDifficulties[0])*T*(N + 1) * 99) / (100 * 2 * L);
+
+	// Implement LWMA-2 changes from LWMA
+	prev_D = cumulativeDifficulties[N] - cumulativeDifficulties[N - 1];
+	if (sum_3_ST < (8 * T) / 10) { next_D = (prev_D * 110) / 100; }
+
+	return static_cast<uint64_t>(next_D);
+
+	// next_Target = sumTargets*L*2/0.998/T/(N+1)/N/N; // To show the difference.
+}
 bool Currency::checkProofOfWork(Crypto::cn_context& context, const Block& block, difficulty_type currentDiffic,
   Crypto::Hash& proofOfWork) const {
 
